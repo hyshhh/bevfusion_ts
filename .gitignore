@@ -1,0 +1,22 @@
+# 数据与输出
+data/
+runs/
+viz/
+build/
+*.pkl
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# 编译产物
+*.so
+*.o
+*.a
+
+# 编辑器
+.vscode/
+.idea/

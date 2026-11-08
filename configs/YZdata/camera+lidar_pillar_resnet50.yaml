@@ -1,0 +1,422 @@
+# =====================================================================
+# YZ 数据集：单相机 + 单 LiDAR，ResNet-50 相机分支
+# LiDAR 主干 = PointPillars（方案 A：柱子和 BEV 格子同尺寸，直接对齐）
+# 标了 【改】 的地方按你的数据修改，其余保持默认
+# 运行：
+#   conda activate bevfusion
+#   torchpack dist-run -np 1 python tools/train.py configs/YZdata/camera+lidar_resnet50.yaml
+# =====================================================================
+
+# ---------------------- 数据集 【改】 ----------------------
+dataset_type: NuScenesDataset
+dataset_root: data/data_old/                     # 【改】 原始数据根目录
+ann_train: data/data_pkl/custom_3000/infos_train.pkl          # 【改】 训练集 info（make_infos.py 生成）
+ann_val: data/data_pkl/custom_3000/infos_val.pkl              # 【改】 验证集 info（make_infos.py 生成）
+
+object_classes:                                   # 【改】 类别，顺序即 label id
+  - boat
+  - pier
+  - pillar
+  - shore
+  - pontoon
+  - bridge
+  - buoy
+  - architecture
+  - islands
+
+# ---------------------- 传感器 【改】 ----------------------
+# 相机数量：不在配置里，= info['cams'] 里有几个相机就是几个（放 1 个即单相机）
+# LiDAR 数量：固定 1 个。每条 info 只有一个 lidar_path；多雷达要先合成一份点云
+# 分支开关：input_modality 与 model.encoders 的 key 要一致
+lidar_dims: 4                                     # 【改】 点云前几维：x,y,z,intensity
+image_size: [384, 704]                            # 【改】 送入网络的图像尺寸 (H, W)，所有相机共用
+point_cloud_range: [-30.0, -120.0, -14.0, 210.0, 120.0, 2.0]   # 【改】 与标注的裁剪范围一致
+# 注意：换成 PointPillars 后 voxel_size 不再用于 LiDAR 体素化
+#       （lidar 用的是 pillar_size=2.4），这里只剩两个用途：
+#       1) 推出 bev_stride = voxel_size[0]*8 = 2.4，即 BEV 格大小
+#       2) 供 head 的 bbox_coder 算解码步长（0.3*8=2.4）
+voxel_size: [0.3, 0.3, 0.4]
+
+# voxel_grid 现在只喂给 head 的 grid_size（800//8 = 100 必须等于 BEV 格数）
+# z=41 已经不参与任何计算（没有 SparseEncoder 了），改 z 不会再影响通道数
+voxel_grid:
+  - "${int(round((point_cloud_range[3] - point_cloud_range[0]) / voxel_size[0]))}"
+  - "${int(round((point_cloud_range[4] - point_cloud_range[1]) / voxel_size[1]))}"
+  - "${int(round((point_cloud_range[5] - point_cloud_range[2]) / voxel_size[2])) + 1}"
+bev_stride: "${voxel_size[0] * 8}"                # 8=out_size_factor
+pillar_size: "${bev_stride}"                      # 柱子边长 = BEV 格边长 = 2.4 m
+
+# ---------------------- 数据增强 【改】 ----------------------
+augment2d:
+  resize: [[0.40, 0.55], [0.47, 0.47]]            # 【改】 下限 >= max(704/原图宽, 256/原图高)
+  rotate: [-5.4, 5.4]
+  gridmask:
+    prob: 0.0
+    fixed_prob: true
+
+augment3d:
+  scale: [0.9, 1.1]
+  rotate: [-0.78539816, 0.78539816]
+  translate: 0.5
+
+input_modality:
+  use_lidar: true
+  use_camera: true
+  use_radar: false
+  use_map: false
+  use_external: false
+
+# =====================================================================
+# 模型
+# =====================================================================
+model:
+  type: BEVFusion
+  encoders:
+    camera:
+      backbone:
+        type: ResNet
+        depth: 50
+        num_stages: 4
+        out_indices: [1, 2, 3]                    # 输出 512/1024/2048
+        norm_cfg:
+          type: BN2d
+          requires_grad: true
+        norm_eval: false
+        init_cfg:
+          type: Pretrained
+          checkpoint: torchvision://resnet50
+      neck:
+        type: GeneralizedLSSFPN
+        in_channels: [512, 1024, 2048]
+        out_channels: 256
+        start_level: 0
+        num_outs: 3
+        norm_cfg:
+          type: BN2d
+          requires_grad: true
+        act_cfg:
+          type: ReLU
+          inplace: true
+        upsample_cfg:
+          mode: bilinear
+          align_corners: false
+      vtransform:
+        type: LSSTransform
+        in_channels: 256
+        out_channels: 64
+        image_size: "${image_size}"
+        feature_size: "${[image_size[0] // 8, image_size[1] // 8]}"
+        xbound: "${[point_cloud_range[0], point_cloud_range[3], bev_stride]}"
+        ybound: "${[point_cloud_range[1], point_cloud_range[4], bev_stride]}"
+        zbound: [-10.0, 10.0, 20.0]
+        dbound: [1.0, 60.0, 1.0]                  # 【改】 按你的激光最远距离
+        downsample: 1
+    lidar:
+      voxelize:
+        max_num_points: 32                        # 柱子内最多保留多少点
+        point_cloud_range: "${point_cloud_range}"
+        voxel_size: ["${pillar_size}", "${pillar_size}", 16.0]   # z 一次覆盖全高 = 柱子
+        max_voxels: [12000, 16000]
+      voxelize_reduce: false                      # 必须 false：PillarFeatureNet 要 max_points 维
+      backbone:
+        type: PointPillarsEncoder
+        pts_voxel_encoder:
+          type: PillarFeatureNet
+          in_channels: "${lidar_dims}"
+          feat_channels: [64, 64]
+          with_distance: false
+          voxel_size: ["${pillar_size}", "${pillar_size}", 16.0]
+          point_cloud_range: "${point_cloud_range}"
+          norm_cfg:
+            type: BN1d
+            eps: 1.0e-3
+            momentum: 0.01
+        pts_middle_encoder:
+          type: PointPillarsScatter
+          in_channels: 64
+          # pillar 网格 = BEV 网格（都等于 跨度 / bev_stride）
+          output_shape: "${[int(round((point_cloud_range[3] - point_cloud_range[0]) / (voxel_size[0] * 8))), int(round((point_cloud_range[4] - point_cloud_range[1]) / (voxel_size[0] * 8)))]}"
+  fuser:
+    type: ConvFuser
+    in_channels: [64, 64]                         # [64]=相机 BEV, [64]=pillar BEV
+    out_channels: 256
+  decoder:
+    backbone:
+      type: SECOND
+      in_channels: 256
+      out_channels: [128, 256]
+      layer_nums: [5, 5]
+      layer_strides: [1, 2]
+      norm_cfg:
+        type: BN
+        eps: 1.0e-3
+        momentum: 0.01
+      conv_cfg:
+        type: Conv2d
+        bias: false
+    neck:
+      type: SECONDFPN
+      in_channels: [128, 256]
+      out_channels: [256, 256]
+      upsample_strides: [1, 2]
+      norm_cfg:
+        type: BN
+        eps: 1.0e-3
+        momentum: 0.01
+      upsample_cfg:
+        type: deconv
+        bias: false
+      use_conv_for_no_stride: true
+  heads:
+    object:
+      type: TransFusionHead
+      num_proposals: 200
+      auxiliary: true
+      in_channels: 512
+      hidden_channel: 128
+      num_classes: "${len(object_classes)}"       # 自动 = 类别数
+      num_decoder_layers: 1
+      num_heads: 8
+      nms_kernel_size: 3
+      ffn_channel: 256
+      dropout: 0.1
+      bn_momentum: 0.1
+      activation: relu
+      train_cfg:
+        dataset: custom                           # 不要改成 nuScenes（会按 10 类硬编码）
+        point_cloud_range: "${point_cloud_range}"
+        grid_size: "${voxel_grid}"
+        voxel_size: "${voxel_size}"
+        out_size_factor: 8
+        gaussian_overlap: 0.1
+        min_radius: 2
+        pos_weight: -1
+        code_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2]
+        assigner:
+          type: HungarianAssigner3D
+          iou_calculator:
+            type: BboxOverlaps3D
+            coordinate: lidar
+          cls_cost:
+            type: FocalLossCost
+            gamma: 2.0
+            alpha: 0.25
+            weight: 0.15
+          reg_cost:
+            type: BBoxBEVL1Cost
+            weight: 0.25
+          iou_cost:
+            type: IoU3DCost
+            weight: 0.25
+      test_cfg:
+        dataset: custom
+        grid_size: "${voxel_grid}"
+        out_size_factor: 8
+        voxel_size: "${voxel_size[:2]}"
+        pc_range: "${point_cloud_range[:2]}"
+        nms_type: null
+      common_heads:
+        center: [2, 2]
+        height: [1, 2]
+        dim: [3, 2]
+        rot: [2, 2]
+        vel: [2, 2]
+      bbox_coder:
+        type: TransFusionBBoxCoder
+        pc_range: "${point_cloud_range[:2]}"
+        post_center_range: "${point_cloud_range}"
+        score_threshold: 0.0
+        out_size_factor: 8
+        voxel_size: "${voxel_size[:2]}"
+        code_size: 10
+      loss_cls:
+        type: FocalLoss
+        use_sigmoid: true
+        gamma: 2.0
+        alpha: 0.25
+        reduction: mean
+        loss_weight: 1.0
+      loss_heatmap:
+        type: GaussianFocalLoss
+        reduction: mean
+        loss_weight: 1.0
+      loss_bbox:
+        type: L1Loss
+        reduction: mean
+        loss_weight: 0.25
+
+# =====================================================================
+# Pipeline
+# =====================================================================
+train_pipeline:
+  - type: LoadMultiViewImageFromFiles
+    to_float32: true
+  - type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: "${lidar_dims}"
+    use_dim: "${lidar_dims}"
+    reduce_beams: null
+  - type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: false
+  - type: ImageAug3D
+    final_dim: "${image_size}"
+    resize_lim: "${augment2d.resize[0]}"
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: "${augment2d.rotate}"
+    rand_flip: true
+    is_train: true
+  - type: GlobalRotScaleTrans
+    resize_lim: "${augment3d.scale}"
+    rot_lim: "${augment3d.rotate}"
+    trans_lim: "${augment3d.translate}"
+    is_train: true
+  - type: RandomFlip3D
+  - type: PointsRangeFilter
+    point_cloud_range: "${point_cloud_range}"
+  - type: ObjectRangeFilter
+    point_cloud_range: "${point_cloud_range}"
+  - type: ObjectNameFilter
+    classes: "${object_classes}"
+  - type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  - type: GridMask
+    use_h: true
+    use_w: true
+    max_epoch: "${max_epochs}"
+    rotate: 1
+    offset: false
+    ratio: 0.5
+    mode: 1
+    prob: "${augment2d.gridmask.prob}"
+    fixed_prob: "${augment2d.gridmask.fixed_prob}"
+  - type: PointShuffle
+  - type: DefaultFormatBundle3D
+    classes: "${object_classes}"
+  - type: Collect3D
+    keys: [img, points, gt_bboxes_3d, gt_labels_3d]
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+
+test_pipeline:
+  - type: LoadMultiViewImageFromFiles
+    to_float32: true
+  - type: LoadPointsFromFile
+    coord_type: LIDAR
+    load_dim: "${lidar_dims}"
+    use_dim: "${lidar_dims}"
+    reduce_beams: null
+  - type: LoadAnnotations3D
+    with_bbox_3d: true
+    with_label_3d: true
+    with_attr_label: false
+  - type: ImageAug3D
+    final_dim: "${image_size}"
+    resize_lim: "${augment2d.resize[1]}"
+    bot_pct_lim: [0.0, 0.0]
+    rot_lim: [0.0, 0.0]
+    rand_flip: false
+    is_train: false
+  - type: GlobalRotScaleTrans
+    resize_lim: [1.0, 1.0]
+    rot_lim: [0.0, 0.0]
+    trans_lim: 0.0
+    is_train: false
+  - type: PointsRangeFilter
+    point_cloud_range: "${point_cloud_range}"
+  - type: ImageNormalize
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  - type: DefaultFormatBundle3D
+    classes: "${object_classes}"
+  - type: Collect3D
+    keys: [img, points, gt_bboxes_3d, gt_labels_3d]
+    meta_keys:
+      - camera_intrinsics
+      - camera2ego
+      - lidar2ego
+      - lidar2camera
+      - camera2lidar
+      - lidar2image
+      - img_aug_matrix
+      - lidar_aug_matrix
+
+# =====================================================================
+# 数据 / 训练
+# =====================================================================
+data:
+  samples_per_gpu: 8                              # 【改】 实测 8 = 19.5GB/8.7样本每秒
+  workers_per_gpu: 4
+  train:
+    type: "${dataset_type}"
+    dataset_root: "${dataset_root}"
+    ann_file: "${ann_train}"
+    pipeline: "${train_pipeline}"
+    object_classes: "${object_classes}"
+    modality: "${input_modality}"
+    test_mode: false
+    use_valid_flag: false                         # 用 num_lidar_pts > 0 过滤
+    box_type_3d: LiDAR
+  val:
+    type: "${dataset_type}"
+    dataset_root: "${dataset_root}"
+    ann_file: "${ann_val}"
+    pipeline: "${test_pipeline}"
+    object_classes: "${object_classes}"
+    modality: "${input_modality}"
+    test_mode: false
+    use_valid_flag: false
+    box_type_3d: LiDAR
+  test:
+    type: "${dataset_type}"
+    dataset_root: "${dataset_root}"
+    ann_file: "${ann_val}"
+    pipeline: "${test_pipeline}"
+    object_classes: "${object_classes}"
+    modality: "${input_modality}"
+    test_mode: true
+    use_valid_flag: false
+    box_type_3d: LiDAR
+
+checkpoint_config:
+  interval: 1
+  max_keep_ckpts: 3          # 保留 3 个，避免一个坏 epoch 覆盖掉好权重
+
+evaluation:
+  interval: 999                                   # 【改】 有 nuScenes 式评测目录再改成 1
+  pipeline: "${test_pipeline}"
+
+# 精度开关：命令行写 use_fp16=True 即启用混合精度
+#   use_fp16: false -> fp32（NanSafeOptimizerHook，nan 步会跳过）
+#   use_fp16: true  -> fp16（Fp16OptimizerHook + wrap_fp16_model，显存约减半）
+use_fp16: false
+loss_scale: dynamic
+fp16: "${ {'loss_scale': loss_scale} if use_fp16 else None }"
+
+max_epochs: 20
+
+optimizer:
+  type: AdamW
+  lr: 2.5e-4          # batch 8；按论文等效 lr 给(2e-4@8)，别再往上抬
+  weight_decay: 0.01
+
+optimizer_config:
+  grad_clip:
+    max_norm: 35
+    norm_type: 2
+
+lr_config:
+  policy: CosineAnnealing
+  warmup: linear
+  warmup_iters: 500
+  warmup_ratio: 0.33333333
+  min_lr_ratio: 1.0e-3
