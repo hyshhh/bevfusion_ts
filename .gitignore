@@ -1,0 +1,30 @@
+# 数据与训练产物
+data/
+runs/
+work_dirs/
+*.pth
+*.pt
+*.onnx
+*.engine
+*.trt
+*.tgz
+*.pkl
+*.npy
+*.bin
+output/
+qat/ckpt/
+qat/onnx_*/
+example-data/*.pth
+viz/
+# python
+__pycache__/
+*.py[cod]
+*.so
+*.o
+build/
+*.egg-info/
+.dist_test/
+.pytest_cache/
+# 编辑器
+.vscode/
+.idea/
