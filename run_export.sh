@@ -45,7 +45,10 @@ SCN_OUT=$(ls -t qat/onnx_$MODE/lidar.backbone.*.onnx 2>/dev/null | head -1)
 # int8：对 ORT 能解析的模块做静态 PTQ（QDQ）；spconv 自定义算子会被自动跳过
 if [ "$MODE" = "int8" ]; then
   echo ">>> INT8 量化（onnxruntime 静态 PTQ，校准样本 ${CALIB_N:-8}）"
-  QFILES=$(ls qat/onnx_int8/*.onnx 2>/dev/null | grep -v '\.int8\.onnx$' || true)
+  # fuser 用 ORT PTQ 会崩（实测相对 L2 >90%），默认跳过 → 打包里保持 fp32，部署端交给 TensorRT 自己校准
+  INT8_EXCLUDE=${INT8_EXCLUDE:-fuser.onnx}
+  QFILES=$(ls qat/onnx_int8/*.onnx 2>/dev/null | grep -v '\.int8\.onnx$' \
+           | grep -v "/${INT8_EXCLUDE}$" || true)
   # 有真实校准数据时：CALIB_NPZ=calib.npz bash run_export.sh ... int8  （npz 键名=输入名）
   if [ -n "${CALIB_NPZ:-}" ]; then
     python qat/quantize_onnx_int8.py $QFILES --calib=${CALIB_N:-8} --calib-npz="$CALIB_NPZ"
