@@ -54,33 +54,3 @@ python qat/export-scn.py --ckpt=$DEPLOY_CKPT \
 # fp32 ONNX -> int8 QDQ（可批量；spconv 模块会自动跳过）
 python qat/quantize_onnx_int8.py qat/onnx_int8/*.onnx --calib 16
 tar czf deploy_int8.tgz -C qat/onnx_int8 .
-
-# int8 实测（新权重，单相机）
-# camera.backbone  98.1MB -> 25.0MB  Q/DQ 82/198
-# fuser            19.1MB ->  4.8MB  Q/DQ 20/51
-# head.bbox         5.3MB ->  2.6MB  Q/DQ 123/180
-# lidar.backbone    跳过：spconv 自定义算子 onnxruntime 不支持，走部署框架自己的转换
-
-# 产出（qat/onnx_fp16/ 或 qat/onnx_int8/）
-ls qat/onnx_fp16/
-# camera.backbone.onnx  img[1,1,3,256,704]   -> feat / depth_weights
-# camera.vtransform.onnx feat_in             -> bev_pool 用
-# fuser.onnx            cam_bev+lidar_bev    -> middle[1,512,180,180]
-# head.bbox.onnx        middle[1,512,180,180]-> score/rot/dim/reg/height/vel
-# lidar.backbone.onnx   points               -> lidar_bev[1,128,180,180]
-
-# 部署端精度开关（TensorRT）
-# fp16：trtexec --onnx=xxx.onnx --fp16 --saveEngine=xxx.engine
-# int8：ONNX 已带 QDQ，直接 --int8 构建；若用 fp32 图则需 --int8 --calib=cache.txt
-# 混精：config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS) 后逐层设 precision
-
-# 注意：不要加这个变量，会让 MAGMA 在 torch.inverse 崩（exit 134）
-# PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-
-# 注意：权重和 yaml 必须配套，否则 load_checkpoint 会跳过不匹配的层
-# 导出脚本启动会打印 [info] deploy cfg: <pickle 里记录的 yaml 路径>
-
-# 无法 ONNX 导出的部分（部署端自己实现）
-# LiDAR sparse conv  走部署框架的权重转换
-# bev_pool           自定义 CUDA kernel（视锥 -> BEV）
-# 检测头后处理       topk / circle-NMS
