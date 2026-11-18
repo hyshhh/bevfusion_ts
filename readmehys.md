@@ -71,3 +71,42 @@ tar czf deploy_int8.tgz -C qat/onnx_int8 .
 # head.bbox         5.3MB ->  2.6MB  相对 L2 18.1%  余弦 0.979  ✅（需端上验 mAP）
 # fuser            19.1MB  保持 fp32  相对 L2 94~125%        ❌ ORT PTQ 量化崩，交给 TensorRT 校准
 # lidar.backbone    5.1MB  保持 fp32  spconv 自定义算子 ORT 不支持
+
+# ---------------------------------------------------------------- int8 QAT（量化感知训练）
+# ① 修 pytorch_quantization：cuda_ext 与 torch 1.10.1 ABI 不匹配，打补丁换成纯 Torch fake-quant
+python qat/patch_pytorch_quantization.py
+
+# ② 快速路径：不训练，只校准 32 帧就把 quantizer 的 amax 定下来，直接出 QDQ 模型
+python tools/qat_calibrate.py \
+    configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
+    runs/yz_z8_160ft_pscore/best_mAP.pth \
+    --ann data/data_pkl/custom_3000/infos_val.pkl \
+    --num 32 --out qat/ckpt/deploy_qat.pth
+
+# ③ QAT 微调：Conv1d/2d/3d + Linear 全部插入 fake-quant（实测 282 个量化模块）
+#    fp32 训练（避免 fp16 叠加溢出），lr 要小，只让权重适应量化误差
+python tools/train_qat.py \
+    configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
+    --run-dir runs/yz_qat \
+    --load-from runs/yz_z8_160ft_pscore/best_mAP.pth \
+    max_epochs=10 data.samples_per_gpu=4 use_fp16=False optimizer.lr=1e-5
+# QAT 权重再校准一次，产出带 amax 的可导出 pickle
+python tools/qat_calibrate.py \
+    configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
+    runs/yz_qat/epoch_10.pth \
+    --ann data/data_pkl/custom_3000/infos_val.pkl \
+    --num 32 --out qat/ckpt/deploy_qat.pth
+
+# ④ 导出 QDQ ONNX（head 必须 --std-layernorm，否则 ORT 不认 nv:: 自定义算子）
+python qat/export-camera.py --ckpt=qat/ckpt/deploy_qat.pth --device cpu
+python qat/export-transfuser.py --ckpt=qat/ckpt/deploy_qat.pth --device cpu --std-layernorm
+python qat/export-scn.py --ckpt=qat/ckpt/deploy_qat.pth \
+    --save=qat/onnx_int8/lidar.backbone.onnx --device cpu
+
+# ⑤ 校验 Q/DQ 节点（实测：camera.backbone 112 对、head.bbox 44 对）
+python - <<'PY'
+import onnx, collections
+for p in ["qat/onnx_int8/camera.backbone.onnx", "qat/onnx_int8/head.bbox.onnx"]:
+    m = onnx.load(p); ops = collections.Counter(n.op_type for n in m.graph.node)
+    print(p, "QDQ =", ops.get("QuantizeLinear", 0))
+PY
