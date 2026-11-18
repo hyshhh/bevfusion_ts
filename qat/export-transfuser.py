@@ -125,6 +125,9 @@ if __name__ == "__main__":
     # 覆盖按类配额（逗号分隔，例如 "20,28,32,20,48,24,36,20,36"）；
     # 不传则用 pickle 里模型自带的值（由 to_deploy_ckpt.py 从 yaml 烘进去）
     parser.add_argument('--per-class-topk', type=str, default=None)
+    # 用标准 LayerNorm（torch 原生分解）导出，供 onnxruntime 做 int8 PTQ 用；
+    # 默认仍用 nv::CustomLayerNormalization（TensorRT 友好，但 ORT 不认）
+    parser.add_argument('--std-layernorm', action='store_true')
     args = parser.parse_args()
     model = __ckpt = torch.load(args.ckpt, map_location="cpu")
     model = getattr(__ckpt, "module", __ckpt)
@@ -152,7 +155,8 @@ if __name__ == "__main__":
     model.eval()
     fuser    = SubclassFuser(model).to(dev)
     headbbox = SubclassHeadBBox(model).to(dev)
-    replace_layernorm(headbbox)
+    if not args.std_layernorm:
+        replace_layernorm(headbbox)
 
     # 通道数按模型实际值取（nuScenes 是 80/256，本数据集是 64/128）
     cam_ch = model.encoders.camera.vtransform.C
