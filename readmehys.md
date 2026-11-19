@@ -99,10 +99,10 @@ python tools/eval_qat.py \
     configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
     runs/yz_qat/epoch_10.pth \
     --calibrate 32 --calib-method histogram --calib-percentile 99.99
-# QAT 权重再校准一次，产出带 amax 的可导出 pickle
+# QAT 权重再校准一次，产出带 amax 的可导出 pickle（默认校准完自动评测，--no-eval 可关）
 python tools/qat_calibrate.py \
     configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
-    runs/yz_qat20/epoch_20.pth \
+    runs/yz_qat20/best_mAP.pth \
     --ann data/data_pkl/custom_3000/infos_val.pkl \
     --num 32 --out qat/ckpt/deploy_qat.pth
 
