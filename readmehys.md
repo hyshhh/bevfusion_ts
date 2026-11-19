@@ -112,7 +112,13 @@ python qat/export-transfuser.py --ckpt=qat/ckpt/deploy_qat.pth --device cpu --st
 python qat/export-scn.py --ckpt=qat/ckpt/deploy_qat.pth \
     --save=qat/onnx_int8/lidar.backbone.onnx --device cpu
 
-# ⑤ 校验 Q/DQ 节点（实测：camera.backbone 112 对、head.bbox 44 对）
+# ⑤ 结构与数值校验（逐模块对比 PyTorch vs ONNX；--skip 可跳过某些模块）
+python qat/verify_onnx.py configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
+    runs/yz_z8_2002/epoch_200.pth --onnx-dir qat/onnx_fp32 --num 4
+python qat/verify_onnx.py configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
+    runs/yz_qat20/epoch_20.pth --onnx-dir qat/onnx_int8/qat20 --qat --num 4
+
+# ⑥ 校验 Q/DQ 节点（实测：camera.backbone 112 对、head.bbox 44 对）
 python - <<'PY'
 import onnx, collections
 for p in ["qat/onnx_int8/camera.backbone.onnx", "qat/onnx_int8/head.bbox.onnx"]:
