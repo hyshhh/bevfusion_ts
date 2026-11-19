@@ -102,7 +102,7 @@ python tools/eval_qat.py \
 # QAT 权重再校准一次，产出带 amax 的可导出 pickle
 python tools/qat_calibrate.py \
     configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
-    runs/yz_qat/epoch_10.pth \
+    runs/yz_qat20/epoch_20.pth \
     --ann data/data_pkl/custom_3000/infos_val.pkl \
     --num 32 --out qat/ckpt/deploy_qat.pth
 

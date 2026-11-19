@@ -34,6 +34,9 @@ def main():
     ap.add_argument("--out", default="qat/ckpt/deploy_qat.pth")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--fp16", action="store_true", help="导出 fp16（int8 不要开）")
+    ap.add_argument("--eval", dest="do_eval", action="store_true", default=True,
+                    help="校准后顺便评测一遍（默认开）")
+    ap.add_argument("--no-eval", dest="do_eval", action="store_false")
     args = ap.parse_args()
 
     tp_configs.load(args.config, recursive=True)
@@ -73,6 +76,12 @@ def main():
                 print(f"  校准 {i+1}/{args.num}（成功 {ok}）")
     if ok == 0:
         raise RuntimeError("没有任何帧校准成功")
+
+    # 校准完先评测一遍（此时模型就在 GPU 上，量化参数也是最终形态）
+    if args.do_eval:
+        from tools.eval_qat import evaluate_model
+        print("[QAT] 校准完成，开始评测（逐类 AP + mAP）")
+        evaluate_model(model, cfg, ann=args.ann, tag=f"calibrated[{args.num}帧]")
 
     # 收起校准模式，导出用 fake-quant（ONNX 里会变成 Q/DQ 节点）
     for m in raw.modules():

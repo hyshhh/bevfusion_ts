@@ -25,6 +25,36 @@ from mmdet3d.models import build_model
 from mmdet3d.utils import recursive_eval
 
 
+def evaluate_model(model, cfg, ann=None, iou=0.3, score_thr=0.05,
+                   ranges=("0-30", "30-50", "50-80", "80+", "0-80"), tag=""):
+    """对已构建/已校准好的模型跑一遍 val + BEV-AP，打印逐类表格并返回结果。"""
+    from mmcv.parallel import MMDataParallel as _MMDP
+    from mmdet3d.datasets import build_dataloader, build_dataset
+
+    ann = ann or cfg.ann_val
+    ds = build_dataset(dict(cfg.data.test, ann_file=ann))
+    loader = build_dataloader(ds, 1, 2, dist=False, shuffle=False)
+    wrapper = model if isinstance(model, _MMDP) else _MMDP(model, device_ids=[0])
+    wrapper.eval()
+
+    t0 = time.time()
+    results = single_gpu_test(wrapper, loader)
+    infer_time = time.time() - t0
+
+    with open(ann, "rb") as f:
+        infos = pickle.load(f)["infos"]
+    classes = list(cfg.object_classes)
+    if len(results) != len(infos):
+        raise RuntimeError(f"预测 {len(results)} 条，验证集 {len(infos)} 帧，不一致")
+
+    t1 = time.time()
+    res = compute_bev_ap(infos, classes, results, iou=iou,
+                         ranges=list(ranges), score_thr=score_thr)
+    print(f"[eval] 推理 {infer_time:.1f}s，AP 计算 {time.time()-t1:.1f}s" + (f" | {tag}" if tag else ""))
+    print(format_ap_table(classes, res["ranges"], res["ap"], res["mAP"]))
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("config")
@@ -55,9 +85,6 @@ def main():
         print("[eval] 普通模式：fp32/fp16 精度")
 
     ann = args.ann or cfg.ann_val
-    ds = build_dataset(dict(cfg.data.test, ann_file=ann))
-    loader = build_dataloader(ds, 1, 2, dist=False, shuffle=False)
-
     model = build_model(cfg.model, train_cfg=None, test_cfg=cfg.get("test_cfg"))
     load_checkpoint(model, args.checkpoint, map_location="cpu")
     model = MMDataParallel(model.cuda(), device_ids=[0]).eval()
@@ -66,6 +93,8 @@ def main():
     if args.calibrate > 0:
         from mmcv.parallel import MMDataParallel as _MMDP
         raw = model.module
+        _ds = build_dataset(dict(cfg.data.test, ann_file=ann))
+        loader = build_dataloader(_ds, 1, 2, dist=False, shuffle=False)
         qs = [m for m in raw.modules() if "TensorQuantizer" in type(m).__name__]
         for q in qs:
             q.enable_calib()
@@ -90,21 +119,9 @@ def main():
         # "module must have its parameters and buffers on device cuda:0"
         raw.cuda()
         print("[eval] 校准完成，amax 已载入")
-    results = single_gpu_test(model, loader)
-    infer_time = time.time() - t0
-
-    with open(ann, "rb") as f:
-        infos = pickle.load(f)["infos"]
-    classes = list(cfg.object_classes)
-    if len(results) != len(infos):
-        raise RuntimeError(f"预测 {len(results)} 条，验证集 {len(infos)} 帧，不一致")
-
-    t1 = time.time()
-    res = compute_bev_ap(infos, classes, results, iou=args.iou,
-                         ranges=args.ranges, score_thr=args.score_thr)
-    print(f"[eval] 推理 {infer_time:.1f}s，AP 计算 {time.time()-t1:.1f}s")
-    print("ckpt:", os.path.basename(args.checkpoint), "| QAT:", args.qat)
-    print(format_ap_table(classes, res["ranges"], res["ap"], res["mAP"]))
+    res = evaluate_model(model, cfg, ann, iou=args.iou, score_thr=args.score_thr,
+                         ranges=args.ranges,
+                         tag=f"ckpt={os.path.basename(args.checkpoint)} QAT={args.qat}")
 
 
 if __name__ == "__main__":
