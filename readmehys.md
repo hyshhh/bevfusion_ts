@@ -85,10 +85,11 @@ python tools/qat_calibrate.py \
 
 # ③ QAT 微调：Conv1d/2d/3d + Linear 全部插入 fake-quant（实测 282 个量化模块）
 #    fp32 训练（避免 fp16 叠加溢出），lr 要小，只让权重适应量化误差
+#    直接 python 启动即可（脚本内部会自建 world_size=1 进程组；也可以套 torchpack dist-run -np 1）
 python tools/train_qat.py \
     configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
     --run-dir runs/yz_qat \
-    --load-from runs/yz_z8_160ft_pscore/best_mAP.pth \
+    --load-from runs/yz_z8_2002/epoch_200.pth \
     max_epochs=10 data.samples_per_gpu=4 use_fp16=False optimizer.lr=1e-5
 # QAT 权重再校准一次，产出带 amax 的可导出 pickle
 python tools/qat_calibrate.py \

@@ -72,7 +72,26 @@ def enable_qat():
 
 
 def main():
-    dist.init()
+    # 兼容两种启动方式：
+    #   ① torchpack dist-run -np 1 python tools/train_qat.py ...
+    #   ② 直接 python tools/train_qat.py ...（没有 MASTER_HOST，走单卡模式）
+    is_dist = "MASTER_HOST" in os.environ
+    if is_dist:
+        dist.init()
+        local_rank = dist.local_rank()
+        print(f"[QAT] 分布式模式 local_rank={local_rank}")
+    else:
+        # mmdet3d 的 train_model 里 build_dataloader 传的是 num_gpus=None，
+        # 只有 dist=True 时才会用 get_dist_info() 补上 world_size；
+        # 所以直接 python 启动时也要手工建一个 world_size=1 的进程组。
+        import torch.distributed as tdist
+        os.environ.setdefault("LOCAL_RANK", "0")
+        local_rank = 0
+        if not tdist.is_initialized():
+            tdist.init_process_group(backend="nccl",
+                                     init_method="tcp://127.0.0.1:29511",
+                                     world_size=1, rank=0)
+        print("[QAT] 单卡模式（未用 torchpack 启动，已建 world_size=1 进程组）")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("config", metavar="FILE", help="config file")
@@ -87,7 +106,7 @@ def main():
     cfg = Config(recursive_eval(configs), filename=args.config)
 
     torch.backends.cudnn.benchmark = cfg.cudnn_benchmark
-    torch.cuda.set_device(dist.local_rank())
+    torch.cuda.set_device(local_rank)
 
     if args.run_dir is None:
         args.run_dir = auto_set_run_dir()
