@@ -84,13 +84,21 @@ python tools/qat_calibrate.py \
     --num 32 --out qat/ckpt/deploy_qat.pth
 
 # ③ QAT 微调：Conv1d/2d/3d + Linear 全部插入 fake-quant（实测 282 个量化模块）
+#    --calibrate 必给：不给的话 quantizer 停在 dynamic 模式（amax 不进 state_dict，ckpt 里没有量化参数）
+#    histogram + 99.99 分位：稀疏 BEV 用 max 校准会被离群峰毁掉（实测 mAP 0.69 vs 0.90）
 #    fp32 训练（避免 fp16 叠加溢出），lr 要小，只让权重适应量化误差
 #    直接 python 启动即可（脚本内部会自建 world_size=1 进程组；也可以套 torchpack dist-run -np 1）
 python tools/train_qat.py \
     configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
     --run-dir runs/yz_qat \
     --load-from runs/yz_z8_2002/epoch_200.pth \
-    max_epochs=10 data.samples_per_gpu=4 use_fp16=False optimizer.lr=1e-5
+    --calibrate 32 --calib-method histogram --calib-percentile 99.99 \
+    max_epochs=10 data.samples_per_gpu=3 use_fp16=False optimizer.lr=1e-5
+# 评测量化模型（不训练，现场校准后直接出 mAP）
+python tools/eval_qat.py \
+    configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \
+    runs/yz_qat/epoch_10.pth \
+    --calibrate 32 --calib-method histogram --calib-percentile 99.99
 # QAT 权重再校准一次，产出带 amax 的可导出 pickle
 python tools/qat_calibrate.py \
     configs/YZdata/180x180_20_z8_pctopk_ada_pscore.yaml \

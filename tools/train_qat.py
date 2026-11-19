@@ -32,11 +32,17 @@ from mmdet3d.models import build_model
 from mmdet3d.utils import get_root_logger, convert_sync_batchnorm, recursive_eval
 
 
-def enable_qat():
-    """打补丁：Conv2d/Linear → 带 fake-quant 的版本，并启用伪量化。"""
+def enable_qat(calib_method="max", per_channel_weight=True):
+    """打补丁：Conv2d/Linear → 带 fake-quant 的版本，并启用伪量化。
+
+    Args:
+        calib_method: "max" 或 "histogram"（稀疏 BEV 建议 histogram，避开离群峰）
+        per_channel_weight: 权重用 per-channel 量化（更准，部署端 TRT 也支持）
+    """
     try:
         from pytorch_quantization import nn as quant_nn
         from pytorch_quantization import quant_modules
+        from pytorch_quantization.tensor_quant import QuantDescriptor
     except ImportError as e:
         raise RuntimeError(
             "pytorch_quantization 不可用（cuda_ext ABI 不匹配 → 已改为纯 PyTorch 回退，"
@@ -55,8 +61,21 @@ def enable_qat():
                 nn.Conv3d.__name__: "QuantConv3d",
                 nn.Linear.__name__: "QuantLinear"}
 
+    # 校准方式必须在 quant_modules.initialize() 之前设到各类的默认描述符上，
+    # 否则 quantizer 构造完就固定成 max 校准了。
+    desc_in = QuantDescriptor(num_bits=8, calib_method=calib_method)
+    desc_w = QuantDescriptor(num_bits=8, axis=(0,)) if per_channel_weight \
+        else QuantDescriptor(num_bits=8)
+    for _n in ("QuantConv1d", "QuantConv2d", "QuantConv3d", "QuantLinear"):
+        _cls = getattr(quant_nn, _n, None)
+        if _cls is None:
+            continue
+        _cls.default_quant_desc_input = desc_in
+        _cls.default_quant_desc_weight = desc_w
+
     name_map = _orig_names()
     quant_modules.initialize()
+    print(f"[QAT] 校准方式={calib_method} | 权重 per-channel={per_channel_weight}")
 
     # mmcv 的 build_conv_layer 走 CONV_LAYERS 注册表，注册表里存的是导入时绑定的
     # 原始类；不换掉它，ResNet / TransFusion 里用 build_conv_layer 搭的层就不会被量化。
@@ -69,6 +88,56 @@ def enable_qat():
             n_swapped += 1
     print(f"[QAT] mmcv CONV_LAYERS 替换 {n_swapped} 项")
     return quant_nn
+
+
+def calibrate_static(model, cfg, n, device="cuda", percentile=99.99):
+    """用 n 帧真实数据统计 amax，并把 quantizer 切成"静态 fake-quant"。
+
+    关键点：TensorQuantizer 默认不注册 _amax buffer（QuantDescriptor.amax=None），
+    此时处于 dynamic 模式 —— 每次 forward 现算 scale，既不可保存也偏离部署形态。
+    只有调用 load_calib_amax()（内部走 amax setter → register_buffer）之后，
+    _amax 才进 state_dict，ckpt 才会带着量化参数。
+    """
+    import torch
+    from mmcv.parallel import MMDataParallel, collate
+    from mmdet3d.datasets import build_dataset
+
+    qs = [m for m in model.modules() if "TensorQuantizer" in type(m).__name__]
+    if not qs:
+        raise RuntimeError("没有找到 TensorQuantizer，QAT 未生效")
+    for q in qs:
+        q.enable_calib()
+    print(f"[QAT] 校准 {n} 帧，quantizer {len(qs)} 个")
+
+    ann = cfg.get("ann_val", None)
+    ds = build_dataset(dict(cfg.data.test, ann_file=ann) if ann else cfg.data.test)
+    wrapper = MMDataParallel(model.to(device), device_ids=[0]).eval()
+    ok = 0
+    with torch.no_grad():
+        for i in range(min(n, len(ds))):
+            data = collate([ds[i]], samples_per_gpu=1)
+            try:
+                wrapper(return_loss=False, **data)
+                ok += 1
+            except Exception as e:
+                print(f"  [skip] 帧 {i}: {type(e).__name__}: {str(e)[:60]}")
+    if ok == 0:
+        raise RuntimeError("校准一帧都没成功")
+
+    for q in qs:
+        # MaxCalibrator 无参；HistogramCalibrator 必须给 method（percentile 避开离群峰）
+        try:
+            q.load_calib_amax()
+        except TypeError:
+            q.load_calib_amax(method="percentile", percentile=percentile)
+        q.disable_calib()
+        q.use_fb_fake_quant = True
+    # histogram 校准的 amax 落在 CPU 上，搬回 GPU 再继续训练
+    model.to(device)
+    model.train()
+    n_has = sum(1 for q in qs if hasattr(q, "_amax"))
+    print(f"[QAT] 校准完成：{ok}/{n} 帧成功，{n_has}/{len(qs)} 个 quantizer 已有 amax")
+    return model
 
 
 def main():
@@ -99,6 +168,12 @@ def main():
     parser.add_argument("--resume-from", metavar="FILE")
     parser.add_argument("--load-from", metavar="FILE",
                         help="QAT 初始化权重（通常是 PTQ/FP32 训练出来的 ckpt）")
+    parser.add_argument("--calibrate", type=int, default=0,
+                        help="训练前用 N 帧校准 amax（0=不校准，会退化成 dynamic 量化）")
+    parser.add_argument("--calib-method", default="histogram", choices=["max", "histogram"],
+                        help="校准方式，默认 histogram（稀疏 BEV 用 max 会被离群值毁掉）")
+    parser.add_argument("--calib-percentile", type=float, default=99.99,
+                        help="histogram 校准的百分位（越小越激进地裁掉离群值）")
     args, opts = parser.parse_known_args()
 
     configs.load(args.config, recursive=True)
@@ -124,7 +199,7 @@ def main():
     logger.info(f"[QAT] 启用量化感知：Conv2d/Linear → QuantConv2d/QuantLinear")
 
     # 关键：必须在 build_model 之前 patch，否则模型里还是普通 Conv
-    enable_qat()
+    enable_qat(calib_method=args.calib_method)
 
     if cfg.seed is not None:
         random.seed(cfg.seed); np.random.seed(cfg.seed); torch.manual_seed(cfg.seed)
@@ -135,6 +210,13 @@ def main():
     datasets = [build_dataset(cfg.data.train)]
     model = build_model(cfg.model)
     model.init_weights()
+    # 先用 --load-from 权重做校准（train_model 内部还会再 load 一次，幂等）
+    if args.calibrate > 0:
+        if args.load_from:
+            from mmcv.runner import load_checkpoint
+            load_checkpoint(model, args.load_from, map_location="cpu")
+        model = calibrate_static(model, cfg, args.calibrate,
+                                 percentile=args.calib_percentile)
     if cfg.get("sync_bn", None):
         if not isinstance(cfg["sync_bn"], dict):
             cfg["sync_bn"] = dict(exclude=[])
